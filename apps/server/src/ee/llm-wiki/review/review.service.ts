@@ -112,7 +112,7 @@ export const NEGOTIATION_SYSTEM_PROMPT = [
   '- If the user accepts the AI recommendation, implement that recommendation exactly and do not add unrelated improvements.',
   '- Do not substitute a different improvement, broaden the task, or ignore a concrete requested change just because another edit seems useful.',
   '- The body must be real final content, never a plan, TODO list, patch description, or explanation of what should be written.',
-  '- Keep scope tight: do not rewrite unrelated sections or add background material that is not needed for this review item.',
+  '- (Highly Important) The body MUST be RAW Markdown source, not rendered/typeset text, or plain txt',
   '- Match the language, tone, and level of detail of the existing wiki content.',
   '- Prefer facts present in the wiki or DeepSearch results. Do not invent missing facts; put uncertainty or source caveats in notes.',
   '- Avoid external source names/URLs in the body unless they are useful to readers. Put provenance caveats in notes.',
@@ -125,9 +125,10 @@ export const NEGOTIATION_SYSTEM_PROMPT = [
   '- rename-page combined with append-section or replace-page: draft.title is the new page title, and draft.body follows the content action rule.',
   '',
   'Preservation rules for existing pages:',
-  '- This one is IMPORTANT: Preserve existing Markdown formatting unless user explicitly asks to change formatting. DO NOT casually change existing heading levels (#, ##, ###), bold/italic emphasis(*[content]*, **[content]**), lists, tables, code blocks, links, or blockquotes.',
-  '- For append-section, match the surrounding page style for the new section rather than imposing a new Markdown style.',
-  '- For replace-page, keep unaffected sections as close to their original Markdown as possible; only change formatting that is directly required by the requested edit.',
+  '- Formatting requests in the editing brief take precedence over preservation. If the user (or the accepted recommendation) explicitly asks to add/improve Markdown formatting, you MUST convert to proper Markdown: turn numbered/plain-text headings (e.g. "16.", "16.1") into ATX headings (##, ###), turn bullet characters (•, ·) into "-" list items, and apply bold/italic where asked. Source pages imported from Confluence often use plain-text pseudo-formatting (numeric headings, • bullets) — when formatting is requested, normalize these to real Markdown rather than echoing the plain-text style.',
+  '- Otherwise (no formatting request): preserve existing formatting. DO NOT casually change existing heading levels (#, ##, ###), bold/italic emphasis(*[content]*, **[content]**), lists, tables, code blocks, links, or blockquotes.',
+  '- For append-section with no formatting request, match the surrounding page style for the new section rather than imposing a new Markdown style.',
+  '- For replace-page with no formatting request, keep unaffected sections as close to their original Markdown as possible; only change formatting that is directly required by the requested edit.',
   '',
   'Do not add inferred page metadata:',
   '- Do not add document metadata such as "文档状态", "Status", "Approved", owner, reviewer, dates, tags, or classification unless the binding editing brief explicitly asks for those fields.',
@@ -143,11 +144,11 @@ export const NEGOTIATION_SYSTEM_PROMPT = [
   'Example D - rename and rewrite:',
   '{"title":"Service Reliability Runbook","body":"This runbook defines how the service team measures reliability and responds to user-impacting failures.\\n\\n## SLO\\n\\nTrack request success rate and latency against the published SLO.\\n\\n## Incident response\\n\\nEscalate sustained budget burn to the on-call owner and record remediation actions after recovery.","applyOperation":["rename-page","replace-page"],"targetDocId":"doc-reliability","notes":"The brief asks for both a clearer page name and a full structure cleanup."}',
   '',
-  'Final self-check before output:',
+  'Final self-check before output, make sure each one are checked:',
   '- Is the response only one JSON object with title, body, applyOperation, targetDocId, and notes?',
+  '- Is the body RAW Markdown source (literal "#", "**", "-", "|" characters visible in the string), not rendered/typeset text, HTML, or prose?',
   '- Is applyOperation an array with one or two valid actions, consistent with the review type and targetDocId?',
   '- Are existing-page targetDocId values raw ids taken from the provided documents?',
-  '- Is the body wiki-ready markdown with no meta-commentary?',
   '- Did you avoid duplicating the page title as an H1?',
   '- If <current_draft> is present, did you change only the requested parts and avoid reverting earlier settled rounds?',
   'Put a short note about tradeoffs or uncertainty in notes, not in body.',
@@ -190,7 +191,17 @@ export class ReviewService {
       prompt: serialized,
     });
 
-    const parsedJson = extractJson(text);
+    let parsedJson: unknown;
+    try {
+      parsedJson = extractJson(text);
+    } catch (err) {
+      // [临时诊断] 打出模型原始返回全文(前 4000 字符),复现后看模型到底吐了什么。
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `[discover-raw] parse failed: ${reason}\n` +
+          `=== RAW MODEL TEXT (len=${text?.length ?? 0}) ===\n${(text ?? '').slice(0, 4000)}\n=== END RAW ===`,
+      );
+    }
     const result = reviewResultSchema.parse(parsedJson);
     // 强制重写 review item id —— LLM 给的是 rev-1/rev-2 这种顺序短名,跨多次
     // discover 会复用,导致 application 表里不同轮的"rev-1"被混在一起,
@@ -309,7 +320,31 @@ export function extractJson(text: string): unknown {
   if (start === -1 || end === -1 || end < start) {
     throw new Error(`模型返回中找不到 JSON 对象。原始返回:\n${text}`);
   }
-  return JSON.parse(s.slice(start, end + 1));
+  const sliced = s.slice(start, end + 1);
+  try {
+    return JSON.parse(sliced);
+  } catch {
+    // LLM 生成的 body 里常含 shell 命令/正则/路径的裸反斜杠(如 \d、\.、\x),
+    // 没转义成 \\,直接 JSON.parse 会因"非法转义字符"失败。这里把非法的
+    // 裸反斜杠补成合法转义,再 parse 一次。
+    return JSON.parse(sanitizeJsonEscapes(sliced));
+  }
+}
+
+/**
+ * 修复 JSON 字符串里的非法反斜杠转义。
+ *
+ * JSON 合法转义只有 \" \\ \/ \b \f \n \r \t \uXXXX。LLM 写正文时常把 shell/正则/
+ * 路径里的裸反斜杠(\d、\.、splitByChar('\_') 等)直接输出,没转义成 \\。
+ *
+ * 用交替匹配保证幂等正确:先整体吃掉"合法转义序列"(原样保留,避免误伤已正确的
+ * \\d 这种"转义反斜杠+字面d"),只把落单的非法反斜杠补成 \\。
+ */
+function sanitizeJsonEscapes(input: string): string {
+  return input.replace(
+    /\\(["\\/bfnrt]|u[0-9a-fA-F]{4})|\\/g,
+    (match, valid) => (valid ? match : '\\\\'),
+  );
 }
 
 export function normalizeReviewResultReferences(
@@ -331,12 +366,37 @@ export function normalizeReviewItemsByDocIds(
 ): ReviewItem[] {
   const knownDocIds = new Set(docIds);
 
-  return items.map((item) => ({
-    ...item,
-    title: normalizeKnownDocIds(item.title, knownDocIds),
-    detail: normalizeKnownDocIds(item.detail, knownDocIds),
-    recommendation: normalizeKnownDocIds(item.recommendation, knownDocIds),
-  }));
+  return items.map((item) => {
+    // 文本字段:把内嵌的短 id / 裸 id 规范成 [id=完整UUID]。
+    const base = {
+      ...item,
+      title: normalizeKnownDocIds(item.title, knownDocIds),
+      detail: normalizeKnownDocIds(item.detail, knownDocIds),
+      recommendation: normalizeKnownDocIds(item.recommendation, knownDocIds),
+      // 结构化字段:relatedDocIds 里 LLM 可能写了截断短 id,逐个展开回完整 UUID。
+      relatedDocIds: item.relatedDocIds.map((id) =>
+        normalizeRawDocId(id, knownDocIds),
+      ),
+    };
+
+    // 类型专属的 docId 字段(targetDocId / suggestedPrimaryId)也展开。
+    if (base.type === 'suggestion' && base.targetDocId) {
+      return {
+        ...base,
+        targetDocId: normalizeRawDocId(base.targetDocId, knownDocIds),
+      };
+    }
+    if (base.type === 'duplicate' && base.suggestedPrimaryId) {
+      return {
+        ...base,
+        suggestedPrimaryId: normalizeRawDocId(
+          base.suggestedPrimaryId,
+          knownDocIds,
+        ),
+      };
+    }
+    return base;
+  });
 }
 
 export function normalizeResolvedReviewsByDocIds(
@@ -383,7 +443,33 @@ function normalizeRawDocId(value: string, knownDocIds: Set<string>): string {
       return docId;
     }
   }
-  return value;
+  // 兜底:LLM 可能把完整 UUID 截断成前缀(如 "0dde9f1c"),尝试按前缀展开回完整 id。
+  const unwrapped = trimmed.replace(/^\[id=/, '').replace(/\]$/, '');
+  return expandShortDocId(unwrapped, knownDocIds);
+}
+
+/**
+ * 把 LLM 截断的短文档 id 展开回完整 UUID。
+ *
+ * LLM 有时把文档完整 UUID(如 "0dde9f1c-2c5f-46d1-8ff5-b35cfd7852cb")截断成
+ * 前缀(如 "0dde9f1c")写进 relatedDocIds / targetDocId / 正文。这里按前缀在
+ * 已知文档 id 里查找:
+ *   - 恰好命中一个 → 返回完整 UUID
+ *   - 命中 0 个或多个(歧义)→ 原样返回(不臆造)
+ * 已经是完整 id 的会在调用前被精确匹配拦截,不会进到这里。
+ */
+function expandShortDocId(value: string, knownDocIds: Set<string>): string {
+  const trimmed = value.trim();
+  // 太短的前缀(<4 字符)歧义风险高,不展开。
+  if (trimmed.length < 4) return value;
+
+  const matches: string[] = [];
+  for (const docId of knownDocIds) {
+    if (docId === trimmed) return docId; // 已是完整 id
+    if (docId.startsWith(trimmed)) matches.push(docId);
+    if (matches.length > 1) return value; // 多个前缀命中 → 歧义,放弃
+  }
+  return matches.length === 1 ? matches[0] : value;
 }
 
 function normalizeKnownDocIds(text: string, knownDocIds: Set<string>): string {
@@ -405,6 +491,13 @@ function normalizeKnownDocIds(text: string, knownDocIds: Set<string>): string {
       `[id=${docId}]`,
     );
   }
+
+  // 兜底:正文里 [id=<短id>] 形式的截断 id —— 按前缀展开成 [id=完整UUID]。
+  // 上面已把完整 id 处理过;这里捕获剩下的(短 id),逐个尝试展开,展不开则原样保留。
+  normalized = normalized.replace(/\[id=([^\]]+)\]/g, (whole, inner) => {
+    const expanded = expandShortDocId(String(inner).trim(), knownDocIds);
+    return knownDocIds.has(expanded) ? `[id=${expanded}]` : whole;
+  });
 
   return normalized;
 }

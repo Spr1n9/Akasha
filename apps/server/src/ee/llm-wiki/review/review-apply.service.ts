@@ -570,10 +570,16 @@ function resolveTargetSourcePageId(
   docs: ReviewDocMeta[],
 ): string | undefined {
   const docsById = new Map(docs.map((doc) => [doc.id, doc]));
-  const explicitTargetId = draft.targetDocId ?? fallbackTargetDocId(item);
-  return explicitTargetId
-    ? docsById.get(explicitTargetId)?.sourcePageId
-    : undefined;
+  // 优先用 draft.targetDocId,但它是 LLM 在 negotiate 时新生成的,可能把 UUID 抄错
+  // (漏字符/错字符),查不到 docs。此时回退到 item 自带的权威 id(suggestedPrimaryId
+  // /targetDocId)—— 它在 discover 阶段已被规范化,可靠。
+  const candidateIds = [draft.targetDocId, fallbackTargetDocId(item)];
+  for (const id of candidateIds) {
+    if (!id) continue;
+    const sourcePageId = docsById.get(id)?.sourcePageId;
+    if (sourcePageId) return sourcePageId;
+  }
+  return undefined;
 }
 
 function fallbackTargetDocId(item: ReviewItem): string | null {

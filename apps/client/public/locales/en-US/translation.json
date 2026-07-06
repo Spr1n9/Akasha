@@ -1125,6 +1125,7 @@
   "Reverting application ...": "Reverting application ...",
   "Generate plan": "Generate plan",
   "Generate preview": "Generate preview",
+  "Preview is being prepared. If it does not appear, regenerate it.": "Preview is being prepared. If it does not appear, regenerate it.",
   "Preview Diff": "Preview Diff",
   "Apply to Wiki": "Apply to Wiki",
   "Revert": "Revert",

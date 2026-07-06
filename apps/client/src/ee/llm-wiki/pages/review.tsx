@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
+import { diffWordsWithSpace } from "diff";
 import {
   Alert,
   Anchor,
@@ -12,7 +13,6 @@ import {
   SimpleGrid,
   Stack,
   Text,
-  Textarea,
   TextInput,
   Title,
 } from "@mantine/core";
@@ -1117,16 +1117,26 @@ function ResolvedBlock({
                 {t("Only renames the page; body is unchanged.")}
               </Alert>
             ) : (
-              <Textarea
-                value={draft.body}
-                readOnly
-                autosize
-                minRows={4}
-                maxRows={20}
-                styles={{
-                  input: { fontFamily: "monospace", fontSize: "12px" },
-                }}
-              />
+              // 统一走 diff 预览:不再直接展示裸 draft.body —— 它在 append-section 时
+              // 只是新增片段、在 replace 时是整页,语义不一致会让人困惑。没有 diff 时
+              // (plan 进行中或失败)给一个生成预览入口,而不是裸 body。
+              <Alert color="gray" variant="light">
+                <Stack gap="xs">
+                  <Text size="sm">
+                    {t(
+                      "Preview is being prepared. If it does not appear, regenerate it.",
+                    )}
+                  </Text>
+                  <Button
+                    size="xs"
+                    variant="default"
+                    style={{ alignSelf: "flex-start" }}
+                    onClick={onPlan}
+                  >
+                    {t("Generate preview")}
+                  </Button>
+                </Stack>
+              </Alert>
             )}
           </>
         )}
@@ -1554,13 +1564,37 @@ function DiffPane({
               }}
             >
               {diffLineMarker(line.kind)}
-              {line.content || " "}
+              {line.segments && line.segments.length > 0
+                ? line.segments.map((segment, segmentIndex) => (
+                    <span
+                      key={segmentIndex}
+                      style={
+                        segment.changed
+                          ? {
+                              background: diffSegmentBackground(line.kind),
+                              borderRadius: 2,
+                              fontWeight: 600,
+                            }
+                          : undefined
+                      }
+                    >
+                      {segment.text}
+                    </span>
+                  ))
+                : line.content || " "}
             </span>
           </div>
         ))}
       </Paper>
     </Stack>
   );
+}
+
+// 行内"变化片段"的高亮背景:比整行底色更深一档,让真正改动的词更显眼。
+function diffSegmentBackground(kind: HighlightedDiffLineKind): string {
+  if (kind === "added") return "var(--mantine-color-green-3)";
+  if (kind === "removed") return "var(--mantine-color-red-3)";
+  return "transparent";
 }
 
 function getApplicationTitleChange(
@@ -1611,11 +1645,22 @@ function normalizeTitleForComparison(value: string): string {
 
 type HighlightedDiffLineKind = "context" | "added" | "removed" | "omitted";
 
+// 行内片段:把一行再细分成"变化的"和"未变的"两类,用于词级高亮。
+// 只有当一行是 removed/added 且找到了配对行时才会有 segments;
+// 没有 segments 时渲染层退回整行着色。
+type DiffSegment = {
+  text: string;
+  // changed = 这段文字相对配对行真正变了(深色高亮);
+  // unchanged = 这段文字在配对行里也存在(正常色,不高亮)。
+  changed: boolean;
+};
+
 type HighlightedDiffLine = {
   id: string;
   kind: HighlightedDiffLineKind;
   content: string;
   lineNumber: number | null;
+  segments?: DiffSegment[];
 };
 
 function buildHighlightedDiffPreview(
@@ -1750,8 +1795,24 @@ function buildVisibleLineDiff(input: {
   let beforeIndex = 0;
   let afterIndex = 0;
 
+  // 暂存当前连续的"变化块":removed 行 + added 行。一旦遇到 context 行或走完,
+  // 就把这块的 removed/added 行配对、跑词级 diff 生成行内 segments,再 flush 进结果。
+  // 这样"只改了几个字的行"不会整行变色,未变片段保持正常色。
+  let pendingRemoved: { text: string; lineNumber: number }[] = [];
+  let pendingAdded: { text: string; lineNumber: number }[] = [];
+
+  const flushPending = () => {
+    if (pendingRemoved.length === 0 && pendingAdded.length === 0) return;
+    const paired = pairChangeBlock(pendingRemoved, pendingAdded);
+    before.push(...paired.before);
+    after.push(...paired.after);
+    pendingRemoved = [];
+    pendingAdded = [];
+  };
+
   while (beforeIndex < beforeCount && afterIndex < afterCount) {
     if (input.beforeLines[beforeIndex] === input.afterLines[afterIndex]) {
+      flushPending();
       before.push(
         makeHighlightedLine(
           "before",
@@ -1774,50 +1835,96 @@ function buildVisibleLineDiff(input: {
     }
 
     if (lcs[beforeIndex + 1][afterIndex] >= lcs[beforeIndex][afterIndex + 1]) {
-      before.push(
-        makeHighlightedLine(
-          "before",
-          "removed",
-          input.beforeLines[beforeIndex],
-          input.beforeOffset + beforeIndex,
-        ),
-      );
+      pendingRemoved.push({
+        text: input.beforeLines[beforeIndex],
+        lineNumber: input.beforeOffset + beforeIndex,
+      });
       beforeIndex += 1;
     } else {
-      after.push(
-        makeHighlightedLine(
-          "after",
-          "added",
-          input.afterLines[afterIndex],
-          input.afterOffset + afterIndex,
-        ),
-      );
+      pendingAdded.push({
+        text: input.afterLines[afterIndex],
+        lineNumber: input.afterOffset + afterIndex,
+      });
       afterIndex += 1;
     }
   }
 
   while (beforeIndex < beforeCount) {
-    before.push(
-      makeHighlightedLine(
-        "before",
-        "removed",
-        input.beforeLines[beforeIndex],
-        input.beforeOffset + beforeIndex,
-      ),
-    );
+    pendingRemoved.push({
+      text: input.beforeLines[beforeIndex],
+      lineNumber: input.beforeOffset + beforeIndex,
+    });
     beforeIndex += 1;
   }
 
   while (afterIndex < afterCount) {
-    after.push(
+    pendingAdded.push({
+      text: input.afterLines[afterIndex],
+      lineNumber: input.afterOffset + afterIndex,
+    });
+    afterIndex += 1;
+  }
+
+  flushPending();
+
+  return { before, after };
+}
+
+/**
+ * 把一个"变化块"(连续的 removed 行 + added 行)按顺序一一配对,对配对的行跑
+ * 词级 diff(jsdiff diffWordsWithSpace)生成行内 segments —— 只有真正变化的词
+ * 标深色,共享的词保持正常色。多出来的行(没有配对的)整行标变化色(无 segments)。
+ */
+function pairChangeBlock(
+  removed: { text: string; lineNumber: number }[],
+  added: { text: string; lineNumber: number }[],
+): { before: HighlightedDiffLine[]; after: HighlightedDiffLine[] } {
+  const before: HighlightedDiffLine[] = [];
+  const after: HighlightedDiffLine[] = [];
+  const pairCount = Math.min(removed.length, added.length);
+
+  for (let i = 0; i < pairCount; i += 1) {
+    const wordDiff = diffWordsWithSpace(removed[i].text, added[i].text);
+    // removed 行:取"删除的"和"共享的"片段(忽略 added 的部分)。
+    const beforeSegments: DiffSegment[] = wordDiff
+      .filter((part) => !part.added)
+      .map((part) => ({ text: part.value, changed: Boolean(part.removed) }));
+    // added 行:取"新增的"和"共享的"片段(忽略 removed 的部分)。
+    const afterSegments: DiffSegment[] = wordDiff
+      .filter((part) => !part.removed)
+      .map((part) => ({ text: part.value, changed: Boolean(part.added) }));
+
+    before.push({
+      id: `before-${removed[i].lineNumber}`,
+      kind: "removed",
+      content: removed[i].text,
+      lineNumber: removed[i].lineNumber,
+      segments: beforeSegments,
+    });
+    after.push({
+      id: `after-${added[i].lineNumber}`,
+      kind: "added",
+      content: added[i].text,
+      lineNumber: added[i].lineNumber,
+      segments: afterSegments,
+    });
+  }
+
+  // 配对之外多出来的行(纯新增/纯删除):整行标色,不做行内分段。
+  for (let i = pairCount; i < removed.length; i += 1) {
+    before.push(
       makeHighlightedLine(
-        "after",
-        "added",
-        input.afterLines[afterIndex],
-        input.afterOffset + afterIndex,
+        "before",
+        "removed",
+        removed[i].text,
+        removed[i].lineNumber,
       ),
     );
-    afterIndex += 1;
+  }
+  for (let i = pairCount; i < added.length; i += 1) {
+    after.push(
+      makeHighlightedLine("after", "added", added[i].text, added[i].lineNumber),
+    );
   }
 
   return { before, after };
